@@ -1,7 +1,9 @@
+//go:build linux
+
 package seccomp
 
 import (
-	"encoding/json"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -12,13 +14,119 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
-func TestNew_Default(t *testing.T) {
-	want := &specs.LinuxSeccomp{}
-	require.NoError(t, json.Unmarshal(defaultProfileJSON, want))
+func TestNew_DefaultArchitectures(t *testing.T) {
+	var want []specs.Arch
+	switch runtime.GOARCH {
+	case "amd64":
+		want = []specs.Arch{specs.ArchX86_64, specs.ArchX86, specs.ArchX32}
+	case "arm64":
+		want = []specs.Arch{specs.ArchAARCH64, specs.ArchARM}
+	default:
+		t.Skip("OCI runtime binaries are only provided for amd64 and arm64")
+	}
 
-	got, err := New(nil)
+	profile, err := New(nil, nil)
 	require.NoError(t, err)
-	assert.Equal(t, want, got)
+	assert.Equal(t, want, profile.Architectures)
+	assert.Equal(t, specs.ActErrno, profile.DefaultAction)
+	require.NotNil(t, profile.DefaultErrnoRet)
+	assert.Equal(t, uint(38), *profile.DefaultErrnoRet)
+
+	var archPrctlRules []specs.LinuxSyscall
+	for _, rule := range profile.Syscalls {
+		if slices.Contains(rule.Names, "arch_prctl") {
+			archPrctlRules = append(archPrctlRules, rule)
+		}
+	}
+	if runtime.GOARCH == "amd64" {
+		require.Len(t, archPrctlRules, 1)
+		assert.Equal(t, specs.ActAllow, archPrctlRules[0].Action)
+	} else {
+		assert.Empty(t, archPrctlRules)
+	}
+}
+
+func TestNew_CapabilityConditionalRules(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		capabilities []string
+		wantAction   specs.LinuxSeccompAction
+	}{
+		{name: "without ptrace", wantAction: specs.ActErrno},
+		{name: "with ptrace", capabilities: []string{"CAP_SYS_PTRACE"}, wantAction: specs.ActAllow},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			profile, err := New(nil, tc.capabilities)
+			require.NoError(t, err)
+			var matchingRules []specs.LinuxSyscall
+			for _, rule := range profile.Syscalls {
+				if slices.Contains(rule.Names, "kcmp") {
+					matchingRules = append(matchingRules, rule)
+				}
+			}
+			require.Len(t, matchingRules, 1)
+			assert.Equal(t, tc.wantAction, matchingRules[0].Action)
+		})
+	}
+}
+
+func TestNew_SocketPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		capabilities       []string
+		wantAllowRules     int
+		wantAuditDenyRules int
+	}{
+		{name: "without audit write", wantAllowRules: 3, wantAuditDenyRules: 1},
+		{name: "with audit write", capabilities: []string{"CAP_AUDIT_WRITE"}, wantAllowRules: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			profile, err := New(nil, tc.capabilities)
+			require.NoError(t, err)
+			allowRules, algDenyRules, auditDenyRules := 0, 0, 0
+			for _, rule := range profile.Syscalls {
+				if !slices.Contains(rule.Names, "socket") {
+					continue
+				}
+				if rule.Action == specs.ActAllow {
+					allowRules++
+					assert.Contains(t, rule.Args, specs.LinuxSeccompArg{Index: 0, Value: 38, Op: specs.OpNotEqual})
+				}
+				if rule.Action == specs.ActErrno && slices.Contains(rule.Args, specs.LinuxSeccompArg{Index: 0, Value: 38, Op: specs.OpEqualTo}) {
+					algDenyRules++
+					require.NotNil(t, rule.ErrnoRet)
+					assert.Equal(t, uint(1), *rule.ErrnoRet)
+				}
+				if rule.Action == specs.ActErrno && slices.Contains(rule.Args, specs.LinuxSeccompArg{Index: 0, Value: 16, Op: specs.OpEqualTo}) {
+					auditDenyRules++
+				}
+			}
+			assert.Equal(t, tc.wantAllowRules, allowRules)
+			assert.Equal(t, 1, algDenyRules)
+			assert.Equal(t, tc.wantAuditDenyRules, auditDenyRules)
+		})
+	}
+}
+
+func TestLoadProfile_RejectsUnsupportedPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		profile   string
+		wantError string
+	}{
+		{name: "unknown condition", profile: `{"defaultAction":"SCMP_ACT_ERRNO","syscalls":[{"names":["kcmp"],"action":"SCMP_ACT_ALLOW","includes":{"unknownCondition":true}}]}`, wantError: "unknown field"},
+		{name: "missing numeric default errno", profile: `{"defaultAction":"SCMP_ACT_ERRNO","defaultErrno":"ENOSYS","syscalls":[]}`, wantError: "requires a numeric errnoRet"},
+		{name: "mismatched default errno", profile: `{"defaultAction":"SCMP_ACT_ERRNO","defaultErrno":"ENOSYS","defaultErrnoRet":1,"syscalls":[]}`, wantError: "does not match"},
+		{name: "mismatched syscall errno", profile: `{"defaultAction":"SCMP_ACT_ERRNO","syscalls":[{"names":["kcmp"],"action":"SCMP_ACT_ERRNO","errno":"EPERM","errnoRet":38}]}`, wantError: "does not match"},
+		{name: "null rule", profile: `{"defaultAction":"SCMP_ACT_ERRNO","syscalls":[null]}`, wantError: "rule 0 is null"},
+		{name: "disabled profile", profile: `{}`, wantError: "must not disable seccomp"},
+		{name: "unmatched architecture", profile: `{"defaultAction":"SCMP_ACT_ERRNO","archMap":[{"architecture":"SCMP_ARCH_UNKNOWN"}],"syscalls":[]}`, wantError: "no entry for native architecture"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := loadProfile([]byte(tc.profile), nil)
+			require.ErrorContains(t, err, tc.wantError)
+		})
+	}
 }
 
 func TestNew_AdditionalSyscalls(t *testing.T) {
@@ -28,7 +136,7 @@ func TestNew_AdditionalSyscalls(t *testing.T) {
 		"io_uring_register",
 		"io_uring_setup",
 	}
-	profile, err := New(additionalSyscalls)
+	profile, err := New(additionalSyscalls, nil)
 	require.NoError(t, err)
 
 	wantNames := []string{
@@ -60,11 +168,9 @@ func TestNew_AdditionalSyscalls(t *testing.T) {
 
 func TestNew_AdditionalSyscallsOverrideDefaultDenyRules(t *testing.T) {
 	// The default profile has deny rules covering userfaultfd and setns.
-	// userfaultfd's only matching rule is a deny. setns appears in three
-	// rules: the default allow list, then a cap-conditional allow and a
-	// cap-conditional deny whose conditions are dropped when parsing the JSON
-	// into specs.LinuxSeccomp.
-	defaultProfile, err := New(nil)
+	// userfaultfd's only matching rule is a deny. Without CAP_SYS_ADMIN,
+	// setns appears in the default allow list and a conditional deny rule.
+	defaultProfile, err := New(nil, nil)
 	require.NoError(t, err)
 	for _, name := range []string{"userfaultfd", "setns"} {
 		denyRules := 0
@@ -82,7 +188,7 @@ func TestNew_AdditionalSyscallsOverrideDefaultDenyRules(t *testing.T) {
 	// rule for a syscall comes first, so userfaultfd would stay denied.
 	// setns exercises removing a name that appears in several rules,
 	// including allow rules that precede its deny rule.
-	profile, err := New([]string{"userfaultfd", "setns"})
+	profile, err := New([]string{"userfaultfd", "setns"}, nil)
 	require.NoError(t, err)
 	for _, name := range []string{"userfaultfd", "setns"} {
 		var matchingRules []specs.LinuxSyscall

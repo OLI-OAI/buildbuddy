@@ -134,6 +134,7 @@ require (
 	github.com/mitchellh/go-ps v1.0.0
 	github.com/moby/moby/api v1.54.2
 	github.com/moby/moby/client v0.4.1
+	github.com/moby/profiles/seccomp v0.2.3
 	github.com/mwitkow/grpc-proxy v0.0.0-20250813121105-2866842de9a5
 	github.com/ncruces/go-sqlite3 v0.25.2
 	github.com/open-feature/flagd/core v0.13.2

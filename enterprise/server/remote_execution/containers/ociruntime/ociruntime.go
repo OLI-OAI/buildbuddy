@@ -232,7 +232,8 @@ type provider struct {
 	// This is initialized once at startup when CDI devices are configured.
 	cdiRegistry *cdi.Cache
 
-	// Seccomp profile attached to all OCI containers created by this provider.
+	// Capabilities and the matching seccomp profile attached to all OCI containers.
+	capabilities   []string
 	seccompProfile *specs.LinuxSeccomp
 }
 
@@ -259,7 +260,8 @@ func NewProvider(env environment.Env, buildRoot, cacheRoot string) (*provider, e
 	if !slices.Contains([]string{"", "bridge", "off"}, *defaultNetworkMode) {
 		return nil, fmt.Errorf("unsupported 'executor.oci.default_network_mode' setting %q", *defaultNetworkMode)
 	}
-	seccompProfile, err := seccomp.New(*seccompAdditionalSyscalls)
+	configuredCapabilities := append(slices.Clone(capabilities), (*capAdd)...)
+	seccompProfile, err := seccomp.New(*seccompAdditionalSyscalls, configuredCapabilities)
 	if err != nil {
 		return nil, fmt.Errorf("configure OCI seccomp profile: %w", err)
 	}
@@ -450,6 +452,7 @@ func NewProvider(env environment.Env, buildRoot, cacheRoot string) (*provider, e
 		networkPool:    networkPool,
 		lxcfsMount:     lxcfsMount,
 		cdiRegistry:    cdiRegistry,
+		capabilities:   configuredCapabilities,
 		seccompProfile: seccompProfile,
 	}, nil
 }
@@ -489,6 +492,7 @@ func (p *provider) New(ctx context.Context, args *container.Init) (container.Com
 		networkPool:    p.networkPool,
 		lxcfsMount:     p.lxcfsMount,
 		cdiRegistry:    p.cdiRegistry,
+		capabilities:   p.capabilities,
 		seccompProfile: p.seccompProfile,
 
 		blockDevice:        args.BlockDevice,
@@ -556,6 +560,7 @@ type ociContainer struct {
 
 	cdiRegistry *cdi.Cache
 
+	capabilities   []string
 	seccompProfile *specs.LinuxSeccomp
 }
 
@@ -1203,7 +1208,7 @@ func (c *ociContainer) createSpec(ctx context.Context, cmd *repb.Command) (*spec
 		return nil, fmt.Errorf("get container user: %w", err)
 	}
 
-	caps := append(capabilities, *capAdd...)
+	caps := slices.Clone(c.capabilities)
 	spec := specs.Spec{
 		Version: ociVersion,
 		Process: &specs.Process{

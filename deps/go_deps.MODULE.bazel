@@ -289,6 +289,7 @@ use_repo(
     "com_github_mitchellh_go_ps",
     "com_github_moby_moby_api",
     "com_github_moby_moby_client",
+    "com_github_moby_profiles_seccomp",
     "com_github_mwitkow_grpc_proxy",
     "com_github_ncruces_go_sqlite3",
     "com_github_nishanths_exhaustive",
